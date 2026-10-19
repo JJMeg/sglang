@@ -54,6 +54,8 @@ from sglang.srt.beam_search.fork import (
     remap_kv_mapping,
 )
 from sglang.srt.beam_search.joint_select import joint_select, select_final_topk
+from sglang.srt.beam_search.profile import BeamProfile, timed_phase
+from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import is_dp_attention_enabled
 from sglang.srt.managers.overlap_utils import FutureMap, RelayPayload
 from sglang.srt.managers.schedule_batch import (
@@ -107,9 +109,15 @@ class BeamCoordinator(msgspec.Struct, kw_only=True):
     token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator
     tree_cache: BasePrefixCache
     future_map: FutureMap
+    # Gates the [BEAMPROF] phase-timing log; read from the env var at
+    # construction. Off = zero timing overhead.
+    profile_enabled: bool = False
 
     # Live (non-retired) groups; the O(1) gate for the per-forward relay hook.
     _num_live_groups: int = 0
+
+    def __post_init__(self) -> None:
+        self.profile_enabled = envs.SGLANG_LOG_BEAM_PROFILE.get()
 
     @staticmethod
     def request_beam_width(recv_req) -> int:
@@ -219,6 +227,8 @@ class BeamCoordinator(msgspec.Struct, kw_only=True):
         # The leader's decode suffix is a beam path, never a tree entry; this
         # also skips the prefill-time unfinished insert.
         req.skip_radix_cache_insert = True
+        if self.profile_enabled:
+            group.profile = BeamProfile()
         self._num_live_groups += 1
         return None
 
@@ -290,6 +300,11 @@ class BeamCoordinator(msgspec.Struct, kw_only=True):
                     req, leader_pos[i], logits_output, tick=batch.forward_iter
                 )
 
+    def _timed(self, name: str, group: BeamGroup):
+        """Time one phase into the group's profile. A pure no-op when the
+        group has no profile (profiling disabled)."""
+        return timed_phase(name, group.profile)
+
     def select_leader_prefill(
         self,
         req: Req,
@@ -300,17 +315,19 @@ class BeamCoordinator(msgspec.Struct, kw_only=True):
         """Launch half of the leader's prefill tick: first selection, member-row
         spawn, and the relay overwrite (the sampled token is void)."""
         group: BeamGroup = req.beam_group
-        top_logprobs, top_tokens = _rows_topk_logprobs(
-            [logits_output.beam.leader_logits[pos : pos + 1]], group.num_candidates
-        )
-        final = group.next_step_is_final()
-        next_tokens, _ = self._select_group(group, top_logprobs, top_tokens, tick)
+        with self._timed("prefill_select", group):
+            top_logprobs, top_tokens = _rows_topk_logprobs(
+                [logits_output.beam.leader_logits[pos : pos + 1]], group.num_candidates
+            )
+            final = group.next_step_is_final()
+            next_tokens, _ = self._select_group(group, top_logprobs, top_tokens, tick)
         if final:
             # Prefill-terminated (max_new_tokens == 1): no spawn, but the relay
             # slot still needs a token so an overshoot step has a valid input.
             self._stash_next_tokens([req.kv.req_pool_idx], next_tokens[:1])
             return
-        self._spawn_member_rows(group, req)
+        with self._timed("spawn", group):
+            self._spawn_member_rows(group, req)
         req.output_ids.append(0)  # length placeholder; DAG owns history
         self._stash_next_tokens(group.all_rows, next_tokens)
 
@@ -324,7 +341,9 @@ class BeamCoordinator(msgspec.Struct, kw_only=True):
             self._abort_group(group)
             return
         self._reclaim_orphans(group, up_to_tick)
-        if group.commit_pending(up_to_tick):
+        with self._timed("dag", group):
+            finished = group.commit_pending(up_to_tick)
+        if finished:
             self._finish_group(group)
 
     def _spawn_member_rows(self, group: BeamGroup, leader: Req) -> None:
@@ -362,16 +381,18 @@ class BeamCoordinator(msgspec.Struct, kw_only=True):
             group = entry.group
             if group.retired or group.state != BeamGroupState.DECODING:
                 continue
-            top_logprobs, top_tokens = _rows_topk_logprobs(
-                [
-                    capture.leader_logits[gi : gi + 1],
-                    capture.tail_logits[entry.start : entry.end],
-                ],
-                group.num_candidates,
-            )
-            next_tokens, parent_idx = self._select_group(
-                group, top_logprobs, top_tokens, batch.forward_iter
-            )
+            with self._timed("topk", group):
+                top_logprobs, top_tokens = _rows_topk_logprobs(
+                    [
+                        capture.leader_logits[gi : gi + 1],
+                        capture.tail_logits[entry.start : entry.end],
+                    ],
+                    group.num_candidates,
+                )
+            with self._timed("joint", group):
+                next_tokens, parent_idx = self._select_group(
+                    group, top_logprobs, top_tokens, batch.forward_iter
+                )
             self._apply_survivors(group, next_tokens, parent_idx, batch.forward_iter)
 
     def commit_decode(self, batch: ScheduleBatch) -> set:
@@ -393,7 +414,9 @@ class BeamCoordinator(msgspec.Struct, kw_only=True):
                 self._abort_group(group)
                 newly_finished.add(id(group))
                 continue
-            if group.commit_pending(batch.forward_iter):
+            with self._timed("dag", group):
+                finished = group.commit_pending(batch.forward_iter)
+            if finished:
                 self._finish_group(group)
                 newly_finished.add(id(group))
         return newly_finished
@@ -435,15 +458,16 @@ class BeamCoordinator(msgspec.Struct, kw_only=True):
         if parent_idx is not None:
             # Final steps skip this: their KV is never read again. Orphans are
             # staged, not freed here -- the set difference must not block launch.
-            old_map, new_map = remap_kv_mapping(
-                self.req_to_token_pool.req_to_token,
-                rows=rows,
-                parent_idx=parent_idx,
-                prefix_len=group.prompt_len,
-                # All rows are synchronized; the leader's committed length
-                # covers the KV computed through this step.
-                seq_len=group.leader.kv.kv_committed_len,
-            )
+            with self._timed("remap", group):
+                old_map, new_map = remap_kv_mapping(
+                    self.req_to_token_pool.req_to_token,
+                    rows=rows,
+                    parent_idx=parent_idx,
+                    prefix_len=group.prompt_len,
+                    # All rows are synchronized; the leader's committed length
+                    # covers the KV computed through this step.
+                    seq_len=group.leader.kv.kv_committed_len,
+                )
             group.pending_orphans.append(StagedOrphans(tick, old_map, new_map))
             # Length placeholder only; the DAG owns history and member rows
             # have no host state.
@@ -470,23 +494,44 @@ class BeamCoordinator(msgspec.Struct, kw_only=True):
         # Plain free(), never a nested free_group: an inner begin/end pair
         # inside the decode path's group double-frees.
         allocator = self.token_to_kv_pool_allocator
-        for entry in staged:
-            orphans = collect_orphan_slots(entry.old_mapping, entry.new_mapping)
-            if orphans.numel():
-                group.slots_freed += orphans.numel()
-                allocator.free(orphans)
+        with self._timed("reclaim", group):
+            for entry in staged:
+                orphans = collect_orphan_slots(entry.old_mapping, entry.new_mapping)
+                if orphans.numel():
+                    group.slots_freed += orphans.numel()
+                    allocator.free(orphans)
 
     def _finish_group(self, group: BeamGroup) -> None:
         # The leader carries the best sequence's finish reason.
-        group.final_results = group.finalize()
-        top = group.final_results[0]
-        leader = group.leader
-        if top.matched_token is not None:
-            leader.finished_reason = FINISH_MATCHED_TOKEN(matched=top.matched_token)
-        else:
-            leader.finished_reason = FINISH_LENGTH(length=group.num_committed)
-        self._free_member_rows(group)
+        with self._timed("finish", group):
+            group.final_results = group.finalize()
+            top = group.final_results[0]
+            leader = group.leader
+            if top.matched_token is not None:
+                leader.finished_reason = FINISH_MATCHED_TOKEN(
+                    matched=top.matched_token
+                )
+            else:
+                leader.finished_reason = FINISH_LENGTH(length=group.num_committed)
+            # free_member_rows nests its own reclaim phase inside this window.
+            self._free_member_rows(group)
         self._retire_group(group)
+        self._emit_beam_profile(group)
+
+    def _emit_beam_profile(self, group: BeamGroup) -> None:
+        """One aggregated [BEAMPROF] line per finished group, gated by
+        SGLANG_LOG_BEAM_PROFILE."""
+        profile = group.profile
+        if profile is None:
+            return
+        logger.info(
+            "[BEAMPROF] rid=%s width=%d steps=%d total=%.3fms %s",
+            group.leader.rid,
+            group.beam_width,
+            group.num_committed,
+            profile.total_ms(),
+            profile.format_summary(),
+        )
 
     def _abort_group(self, group: BeamGroup) -> None:
         group.state = BeamGroupState.FINISHED

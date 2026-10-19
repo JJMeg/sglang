@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(find /Users/hexiaoying/Projects/sglang -type f -name \"server_args.py\" | head -5)",
+      "Read(//Users/hexiaoying/Projects/**)"
+    ]
+  }
+}

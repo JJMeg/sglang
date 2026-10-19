@@ -32,6 +32,7 @@ import torch
 from sglang.srt.beam_search.fork import StagedOrphans
 from sglang.srt.beam_search.history import BeamNode, materialize_tokens
 from sglang.srt.beam_search.joint_select import FinalSelect, SelectResult
+from sglang.srt.beam_search.profile import BeamProfile
 
 
 class BeamGroupState(enum.Enum):
@@ -110,6 +111,9 @@ class BeamGroup:
         # Running total the GC has returned, so held KV is a host-side
         # arithmetic (allocated - freed) rather than a tensor read.
         self.slots_freed = 0
+        # Per-phase wall-clock accumulator, created by the coordinator when
+        # log profiling is enabled; None means no timing.
+        self.profile: Optional[BeamProfile] = None
 
     @property
     def num_member_rows(self) -> int:
