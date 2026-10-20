@@ -8,7 +8,6 @@ import torch
 
 from sglang.kernels.jit.utils import (
     cache_once,
-    is_arch_support_pdl,
     load_jit,
     make_cpp_args,
 )
@@ -25,7 +24,7 @@ MAX_WIDTH = 32
 @cache_once
 def _jit_joint_select_module() -> Module:
     """Compile and cache the JIT joint_select module (no dtype variants)."""
-    args = make_cpp_args(is_arch_support_pdl())
+    args = make_cpp_args(False)  # PDL off: these kernels gain nothing from it
     return load_jit(
         "joint_select",
         *args,
