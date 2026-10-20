@@ -45,6 +45,7 @@ class PhaseTimer(msgspec.Struct):
 class BeamProfile(msgspec.Struct):
     """Per-group phase accumulators; formatted once at group finish."""
 
+    forward: PhaseTimer = field(default_factory=PhaseTimer)
     prefill_select: PhaseTimer = field(default_factory=PhaseTimer)
     spawn: PhaseTimer = field(default_factory=PhaseTimer)
     topk: PhaseTimer = field(default_factory=PhaseTimer)
@@ -54,38 +55,29 @@ class BeamProfile(msgspec.Struct):
     reclaim: PhaseTimer = field(default_factory=PhaseTimer)
     finish: PhaseTimer = field(default_factory=PhaseTimer)
 
+    PHASES = (
+        "forward",
+        "prefill_select",
+        "spawn",
+        "topk",
+        "joint",
+        "remap",
+        "dag",
+        "reclaim",
+        "finish",
+    )
+
     def add(self, phase: str, ms: float) -> None:
         getattr(self, phase).add(ms)
 
     def total_ms(self) -> float:
         """Sum over phases; may exceed real wall time where phases nest
         (finish wraps the reclaim inside free_member_rows)."""
-        return sum(
-            getattr(self, name).total_ms
-            for name in (
-                "prefill_select",
-                "spawn",
-                "topk",
-                "joint",
-                "remap",
-                "dag",
-                "reclaim",
-                "finish",
-            )
-        )
+        return sum(getattr(self, name).total_ms for name in self.PHASES)
 
     def format_summary(self) -> str:
         parts = []
-        for name in (
-            "prefill_select",
-            "spawn",
-            "topk",
-            "joint",
-            "remap",
-            "dag",
-            "reclaim",
-            "finish",
-        ):
+        for name in self.PHASES:
             t = getattr(self, name)
             if t.count == 0:
                 continue

@@ -38,6 +38,7 @@ tick. Commits are tick-gated; BeamGroup.commit_pending documents why.
 from __future__ import annotations
 
 import logging
+import time
 from typing import TYPE_CHECKING, List, Optional, Sequence
 
 import msgspec
@@ -305,6 +306,22 @@ class BeamCoordinator(msgspec.Struct, kw_only=True):
         group has no profile (profiling disabled)."""
         return timed_phase(name, group.profile)
 
+    def _record_pre_beam_time(self, group: BeamGroup) -> None:
+        """Wall time from the previous tick's commit to this tick's selection:
+        batch prep + model forward for the beam rows (the time before beam
+        search). Logged under the `forward` phase. The baselines come from the
+        leader's TimeStats, set by the shared finish machinery."""
+        profile = group.profile
+        if profile is None:
+            return
+        stats = group.leader.time_stats
+        baseline = stats.last_decode_finish_time
+        if baseline == 0.0:
+            baseline = stats.prefill_finished_time
+        if baseline == 0.0:
+            return
+        profile.add("forward", (time.perf_counter() - baseline) * 1000.0)
+
     def select_leader_prefill(
         self,
         req: Req,
@@ -381,6 +398,7 @@ class BeamCoordinator(msgspec.Struct, kw_only=True):
             group = entry.group
             if group.retired or group.state != BeamGroupState.DECODING:
                 continue
+            self._record_pre_beam_time(group)
             with self._timed("topk", group):
                 top_logprobs, top_tokens = _rows_topk_logprobs(
                     [
@@ -524,11 +542,20 @@ class BeamCoordinator(msgspec.Struct, kw_only=True):
         profile = group.profile
         if profile is None:
             return
+        stats = group.leader.time_stats
+        if stats.forward_entry_time > 0.0 and stats.prefill_finished_time > 0.0:
+            prefill_forward = (
+                f"{(stats.prefill_finished_time - stats.forward_entry_time) * 1000.0:.3f}ms"
+            )
+        else:
+            prefill_forward = "n/a"
         logger.info(
-            "[BEAMPROF] rid=%s width=%d steps=%d total=%.3fms %s",
+            "[BEAMPROF] rid=%s width=%d steps=%d prefill_forward=%s "
+            "total=%.3fms %s",
             group.leader.rid,
             group.beam_width,
             group.num_committed,
+            prefill_forward,
             profile.total_ms(),
             profile.format_summary(),
         )
