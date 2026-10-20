@@ -44,6 +44,7 @@ from typing import TYPE_CHECKING, List, Optional, Sequence
 import msgspec
 import torch
 
+from sglang.kernels.ops.sampling.lse_topk import MAX_K as LSE_TOPK_MAX_K, lse_topk
 from sglang.srt.beam_search.beam_group import BeamGroup, BeamGroupState
 from sglang.srt.beam_search.fork import (
     MEMBER_LENGTH_MARGIN,
@@ -85,8 +86,20 @@ logger = logging.getLogger(__name__)
 
 
 def _rows_topk_logprobs(pieces: Sequence[torch.Tensor], num_candidates: int):
-    # One logsumexp per piece: it is not batch-invariant on CUDA, and folding
-    # pieces shifts the leader's lse by an ulp, flipping near-equal beams.
+    """Per-row lse-normalized top-k for the beam rows (leader + members).
+
+    The fused jit kernel handles num_candidates <= LSE_TOPK_MAX_K; its fixed
+    per-row reduction order is batch-invariant, so the leader and member
+    pieces can be merged into one tensor (one launch instead of two). Larger
+    k falls back to the per-piece torch reference: one logsumexp per piece,
+    because torch's is not batch-invariant on CUDA and folding pieces shifts
+    the leader's lse by an ulp, flipping near-equal beams.
+    """
+    if num_candidates <= LSE_TOPK_MAX_K:
+        non_empty = [p for p in pieces if p.shape[0] > 0]
+        if non_empty:
+            x = non_empty[0] if len(non_empty) == 1 else torch.cat(non_empty)
+            return lse_topk(x, num_candidates)
     vals, toks = [], []
     for piece in pieces:
         if piece.shape[0] == 0:
