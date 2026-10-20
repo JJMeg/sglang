@@ -55,7 +55,13 @@ from sglang.srt.beam_search.fork import (
     neutral_member_sampling_params,
     remap_kv_mapping,
 )
-from sglang.srt.beam_search.joint_select import joint_select, select_final_topk
+from sglang.srt.beam_search.joint_select import (
+    JOINT_SELECT_MAX_WIDTH,
+    joint_select,
+    joint_select_fused,
+    select_final_topk,
+    select_final_topk_fused,
+)
 from sglang.srt.beam_search.profile import BeamProfile, timed_phase
 from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import is_dp_attention_enabled
@@ -83,6 +89,11 @@ if TYPE_CHECKING:
     from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 
 logger = logging.getLogger(__name__)
+
+# The batched reclaim's tag machinery (cat, tag arithmetic, bincount, counts
+# D2H) only pays off once its fixed overhead is amortized over this many
+# entries; fewer fall back to the per-entry path.
+BATCH_RECLAIM_MIN_ENTRIES = 3
 
 
 def _rows_topk_logprobs(pieces: Sequence[torch.Tensor], num_candidates: int):
@@ -434,13 +445,22 @@ class BeamCoordinator(msgspec.Struct, kw_only=True):
         newly_finished = set()
         if self._num_live_groups == 0:
             return newly_finished
+        # Stage the tick-gated orphans for every group first, then reclaim
+        # them in one batched pass: one reclaim sync for the whole batch
+        # instead of one per group.
+        staged_groups = []
         for req in batch.reqs:
             group = req.beam_group
             if group is None or group.retired:
                 continue
-            # Reclaim even if the DAG commit is discarded: the launch path
-            # already mutated req_to_token, so the orphans are real either way.
-            self._reclaim_orphans(group, batch.forward_iter)
+            staged = self._stage_orphans(group, batch.forward_iter)
+            if staged:
+                staged_groups.append((group, staged))
+        self._batched_reclaim(staged_groups)
+        for req in batch.reqs:
+            group = req.beam_group
+            if group is None or group.retired:
+                continue
             if req.to_finish is not None:
                 self._abort_group(group)
                 newly_finished.add(id(group))
@@ -460,20 +480,37 @@ class BeamCoordinator(msgspec.Struct, kw_only=True):
         tick: int,
     ):
         k = group.beam_width
+        fused = k <= JOINT_SELECT_MAX_WIDTH
         if group.next_step_is_final():
             # parent_idx is None on a final step: every selection finishes, so
             # no row moves onto another's slots.
-            fsel = select_final_topk(
-                group.frontier_cum_logprobs, top_logprobs, top_tokens, k
+            fsel = (
+                select_final_topk_fused(
+                    group.frontier_cum_logprobs, top_logprobs, top_tokens, k
+                )
+                if fused
+                else select_final_topk(
+                    group.frontier_cum_logprobs, top_logprobs, top_tokens, k
+                )
             )
             group.advance_final_frontier(fsel, tick)
             return fsel.tokens, None
-        sel = joint_select(
-            group.frontier_cum_logprobs,
-            top_logprobs,
-            top_tokens,
-            group.stop_token_ids,
-            k,
+        sel = (
+            joint_select_fused(
+                group.frontier_cum_logprobs,
+                top_logprobs,
+                top_tokens,
+                group.stop_token_ids,
+                k,
+            )
+            if fused
+            else joint_select(
+                group.frontier_cum_logprobs,
+                top_logprobs,
+                top_tokens,
+                group.stop_token_ids,
+                k,
+            )
         )
         group.advance_frontier(sel, tick)
         return sel.next_tokens[:k], sel.parent_idx[:k]
@@ -505,13 +542,11 @@ class BeamCoordinator(msgspec.Struct, kw_only=True):
             group.leader.output_ids.append(0)
         self._stash_next_tokens(rows, next_tokens)
 
-    def _reclaim_orphans(
-        self, group: BeamGroup, up_to_tick: Optional[int] = None
-    ) -> None:
-        # Callers must be past the tick's copy_done sync: collect_orphan_slots
-        # synchronizes, which would stall the launch path.
+    def _stage_orphans(self, group: BeamGroup, up_to_tick: Optional[int]) -> list:
+        """Tick-gate the group's staged orphan entries and remove them from
+        the pending list. Returns the entries eligible for reclaim."""
         if not group.pending_orphans:
-            return
+            return []
         if up_to_tick is None:
             # Teardown drains every staged tick.
             staged, group.pending_orphans = group.pending_orphans, []
@@ -520,17 +555,82 @@ class BeamCoordinator(msgspec.Struct, kw_only=True):
             group.pending_orphans = [
                 e for e in group.pending_orphans if e.tick > up_to_tick
             ]
-        if not staged:
-            return
+        return staged
+
+    def _reclaim_orphans_entry(self, group: BeamGroup, entry: StagedOrphans) -> None:
+        """Reclaim one staged entry: the per-entry path, two syncs (unique +
+        masked select). The caller must be past the tick's copy_done sync."""
         # Plain free(), never a nested free_group: an inner begin/end pair
         # inside the decode path's group double-frees.
         allocator = self.token_to_kv_pool_allocator
+        orphans = collect_orphan_slots(entry.old_mapping, entry.new_mapping)
+        if orphans.numel():
+            group.slots_freed += orphans.numel()
+            allocator.free(orphans)
+
+    def _reclaim_orphans(
+        self, group: BeamGroup, up_to_tick: Optional[int] = None
+    ) -> None:
+        # Per-entry path for teardown (free_member_rows / retire / prefill).
+        staged = self._stage_orphans(group, up_to_tick)
+        if not staged:
+            return
         with self._timed("reclaim", group):
             for entry in staged:
-                orphans = collect_orphan_slots(entry.old_mapping, entry.new_mapping)
-                if orphans.numel():
-                    group.slots_freed += orphans.numel()
-                    allocator.free(orphans)
+                self._reclaim_orphans_entry(group, entry)
+
+    def _batched_reclaim(self, staged_groups) -> None:
+        """One orphan reclaim for every group in this decode commit.
+
+        A single tagged unique computes the union orphan set: each element is
+        tagged with its entry index, so per-entry dedup survives the global
+        unique and a bincount attributes exact per-entry counts. A constant
+        number of syncs for the whole batch instead of one per group.
+        Distinct owners make cross-entry duplicate slots impossible within
+        one drain, so the freed list never double-frees.
+
+        Fewer than BATCH_RECLAIM_MIN_ENTRIES entries fall back to the
+        per-entry path: the tag machinery's fixed overhead only pays off once
+        the amortization covers it."""
+        entries = [(group, e) for group, staged in staged_groups for e in staged]
+        if not entries:
+            return
+        if len(entries) < BATCH_RECLAIM_MIN_ENTRIES:
+            for group, entry in entries:
+                with self._timed("reclaim", group):
+                    self._reclaim_orphans_entry(group, entry)
+            return
+        start = time.perf_counter()
+        n = len(entries)
+        old_parts = [e.old_mapping.flatten() for _, e in entries]
+        new_parts = [e.new_mapping.flatten() for _, e in entries]
+        sizes = [p.numel() for p in old_parts]
+        device = self.req_to_token_pool.device
+        entry_ids = torch.repeat_interleave(
+            torch.arange(n, dtype=torch.int64, device=device),
+            torch.tensor(sizes, dtype=torch.int64, device=device),
+        )
+        tagged = torch.cat(old_parts) * n + entry_ids
+        tagged_unique = tagged.unique()  # the one sync
+        slots = tagged_unique // n
+        orphan_mask = ~torch.isin(slots, torch.cat(new_parts))
+        orphans = slots[orphan_mask]
+        counts = (
+            torch.bincount(tagged_unique[orphan_mask] % n, minlength=n)
+            .cpu()
+            .tolist()
+        )
+        if orphans.numel():
+            # Plain free(), never a nested free_group: an inner begin/end
+            # pair inside the decode path's group double-frees.
+            self.token_to_kv_pool_allocator.free(orphans)
+        for (group, _), c in zip(entries, counts):
+            group.slots_freed += c
+        ms = (time.perf_counter() - start) * 1000.0
+        per_group = ms / len(staged_groups)
+        for group, _ in staged_groups:
+            if group.profile is not None:
+                group.profile.add("reclaim", per_group)
 
     def _finish_group(self, group: BeamGroup) -> None:
         # The leader carries the best sequence's finish reason.

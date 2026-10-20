@@ -28,6 +28,12 @@ from __future__ import annotations
 import msgspec
 import torch
 
+from sglang.kernels.ops.sampling.joint_select import (
+    MAX_WIDTH as JOINT_SELECT_MAX_WIDTH,
+    final_topk as _final_topk_kernel,
+    joint_select as _joint_select_kernel,
+)
+
 
 class SelectResult(msgspec.Struct):
     """Fixed-shape outputs of one expansion step. Valid in [0, num_survivors)
@@ -122,3 +128,48 @@ def select_final_topk(
         cum_logprobs, top_logprobs, top_tokens, beam_width
     )
     return FinalSelect(tokens=tokens, parent_idx=parent, cum_logprobs=cand_scores)
+
+
+def joint_select_fused(
+    cum_logprobs: torch.Tensor,
+    top_logprobs: torch.Tensor,
+    top_tokens: torch.Tensor,
+    stop_token_ids: torch.Tensor,
+    beam_width: int,
+) -> SelectResult:
+    """`joint_select` on the fused JIT kernel (beam_width <= JOINT_SELECT_MAX_WIDTH)."""
+    (
+        next_tokens,
+        parent_idx,
+        new_cum_logprobs,
+        num_survivors,
+        fin_tokens,
+        fin_parent_idx,
+        fin_cum_logprobs,
+        num_finished,
+    ) = _joint_select_kernel(
+        cum_logprobs, top_logprobs, top_tokens, stop_token_ids, beam_width
+    )
+    return SelectResult(
+        next_tokens=next_tokens,
+        parent_idx=parent_idx,
+        new_cum_logprobs=new_cum_logprobs,
+        num_survivors=num_survivors,
+        fin_tokens=fin_tokens,
+        fin_parent_idx=fin_parent_idx,
+        fin_cum_logprobs=fin_cum_logprobs,
+        num_finished=num_finished,
+    )
+
+
+def select_final_topk_fused(
+    cum_logprobs: torch.Tensor,
+    top_logprobs: torch.Tensor,
+    top_tokens: torch.Tensor,
+    beam_width: int,
+) -> FinalSelect:
+    """`select_final_topk` on the fused JIT kernel (beam_width <= JOINT_SELECT_MAX_WIDTH)."""
+    tokens, parent_idx, cum_logprobs = _final_topk_kernel(
+        cum_logprobs, top_logprobs, top_tokens, beam_width
+    )
+    return FinalSelect(tokens=tokens, parent_idx=parent_idx, cum_logprobs=cum_logprobs)

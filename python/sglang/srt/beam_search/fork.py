@@ -121,7 +121,8 @@ def remap_kv_mapping(
 
 def collect_orphan_slots(old_mapping: torch.Tensor, new_mapping: torch.Tensor):
     """Slots referenced before the remap and by nobody after it. Data-dependent
-    shape (unique/isin), so it synchronizes -- keep it off the launch path."""
+    shape (unique/isin), so it synchronizes -- keep it off the launch path.
+    The test side of isin may carry duplicates: membership is unaffected, and
+    skipping its unique saves one sync per reclaim."""
     old_slots = old_mapping.flatten().unique()
-    new_slots = new_mapping.flatten().unique()
-    return old_slots[~torch.isin(old_slots, new_slots)]
+    return old_slots[~torch.isin(old_slots, new_mapping.flatten())]
