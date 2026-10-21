@@ -90,6 +90,11 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+# The fused lse_topk kernels are correct but currently GPU-slower than the
+# torch chain at wide batches (their per-thread lists spill local memory to
+# DRAM). Keep them behind this switch until profiled (ncu) and fixed.
+LSE_TOPK_FUSED = False
+
 # The batched reclaim's tag machinery (cat, tag arithmetic, bincount, counts
 # D2H) only pays off once its fixed overhead is amortized over this many
 # entries; fewer fall back to the per-entry path.
@@ -106,7 +111,7 @@ def _rows_topk_logprobs(pieces: Sequence[torch.Tensor], num_candidates: int):
     because torch's is not batch-invariant on CUDA and folding pieces shifts
     the leader's lse by an ulp, flipping near-equal beams.
     """
-    if num_candidates <= LSE_TOPK_MAX_K:
+    if LSE_TOPK_FUSED and num_candidates <= LSE_TOPK_MAX_K:
         non_empty = [p for p in pieces if p.shape[0] > 0]
         if non_empty:
             x = non_empty[0] if len(non_empty) == 1 else torch.cat(non_empty)

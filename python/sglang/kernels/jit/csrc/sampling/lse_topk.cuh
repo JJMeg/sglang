@@ -312,24 +312,27 @@ __global__ void lse_topk_finalize_kernel(const float* __restrict__ seg_max,
   const int64_t row = blockIdx.x;
 
   // Load: thread t copies list t (all lists are sentinel-padded to the
-  // full kMaxCandidates width by the scan kernel).
-  const float* src = topk_values + row * S * kMaxCandidates + tid * kMaxCandidates;
-  const int32_t* src_idx =
-      topk_idx + row * S * kMaxCandidates + tid * kMaxCandidates;
-  LseTopkPair* dst = lists + tid * kMaxCandidates;
-  for (int j = 0; j < kMaxCandidates; ++j) {
-    dst[j].value = src[j];
-    dst[j].index = src_idx[j];
+  // full kMaxCandidates width by the scan kernel). S is a power of two.
+  if (tid < S) {
+    const float* src =
+        topk_values + row * S * kMaxCandidates + tid * kMaxCandidates;
+    const int32_t* src_idx =
+        topk_idx + row * S * kMaxCandidates + tid * kMaxCandidates;
+    LseTopkPair* dst = lists + tid * kMaxCandidates;
+    for (int j = 0; j < kMaxCandidates; ++j) {
+      dst[j].value = src[j];
+      dst[j].index = src_idx[j];
+    }
   }
   __syncthreads();
 
-  // Parallel merge tree: 64 lists -> 1 (log2 rounds; each round's pairs are
-  // merged by distinct threads, so the whole merge is ~6 sequential rounds
-  // instead of 63).
+  // Parallel merge tree: S lists -> 1 (log2 rounds; each round's pairs are
+  // merged by distinct threads, so the whole merge is ~log2(S) sequential
+  // rounds instead of S - 1).
   float bv[kMaxCandidates];
   int32_t bi[kMaxCandidates];
-  for (int stride = 1; stride < kMaxSegments; stride *= 2) {
-    if (tid % (2 * stride) == 0 && tid + stride < kMaxSegments) {
+  for (int stride = 1; stride < S; stride *= 2) {
+    if (tid % (2 * stride) == 0 && tid + stride < S) {
       LseTopkPair* A = lists + tid * kMaxCandidates;
       LseTopkPair* B = A + stride * kMaxCandidates;
       for (int j = 0; j < kMaxCandidates; ++j) {
@@ -398,21 +401,24 @@ void lse_topk_segment_scan(tvm::ffi::TensorView x,
                            tvm::ffi::TensorView topk_idx,
                            int64_t k,
                            int64_t vocab,
-                           int64_t seg_len) {
+                           int64_t seg_len,
+                           int64_t seg_count) {
   using namespace host;
 
   SymbolicSize rows = {"rows"};
   SymbolicSize vocab_s = {"vocab"};
+  SymbolicSize S_s = {"segments"};
   TensorMatcher({rows, vocab_s}).with_dtype<fp32_t>().verify(x);
-  TensorMatcher({rows, kMaxSegments}).with_dtype<fp32_t>().verify(seg_max);
-  TensorMatcher({rows, kMaxSegments, kMaxCandidates})
+  TensorMatcher({rows, S_s}).with_dtype<fp32_t>().verify(seg_max);
+  TensorMatcher({rows, S_s, kMaxCandidates})
       .with_dtype<fp32_t>()
       .verify(topk_values);
-  TensorMatcher({rows, kMaxSegments, kMaxCandidates})
+  TensorMatcher({rows, S_s, kMaxCandidates})
       .with_dtype<int32_t>()
       .verify(topk_idx);
   const int64_t n_rows = rows.unwrap();
   const int64_t n_vocab = vocab_s.unwrap();
+  const int64_t S = S_s.unwrap();
 
   CHECK_HOST(x.device().device_type == kDLCUDA)
       << "lse_topk: x must be a CUDA tensor";
@@ -425,13 +431,15 @@ void lse_topk_segment_scan(tvm::ffi::TensorView x,
       << "lse_topk: vocab must match x and be a multiple of 4, got " << vocab;
   CHECK_HOST(seg_len > 0 && seg_len % 4 == 0)
       << "lse_topk: seg_len must be a positive multiple of 4, got " << seg_len;
+  CHECK_HOST(S == seg_count && S >= 1 && S <= kMaxSegments &&
+             (S & (S - 1)) == 0)
+      << "lse_topk: segments must be a power of two in [1, " << kMaxSegments
+      << "], got " << seg_count;
   CHECK_HOST(n_vocab <=
              static_cast<int64_t>(std::numeric_limits<int32_t>::max()))
       << "lse_topk: vocab exceeds the int32 index range, got " << n_vocab;
 
-  LaunchKernel(static_cast<uint32_t>(n_rows) * kMaxSegments,
-               kBlockSize,
-               x.device())
+  LaunchKernel(static_cast<uint32_t>(n_rows * S), kBlockSize, x.device())
       .enable_pdl(kUsePDL)(lse_topk_segment_scan_kernel<kUsePDL>,
                            static_cast<const float*>(x.data_ptr()),
                            static_cast<float*>(seg_max.data_ptr()),
@@ -439,7 +447,7 @@ void lse_topk_segment_scan(tvm::ffi::TensorView x,
                            static_cast<int32_t*>(topk_idx.data_ptr()),
                            n_vocab,
                            static_cast<int>(k),
-                           kMaxSegments,
+                           static_cast<int>(S),
                            static_cast<int>(seg_len));
 }
 
@@ -458,16 +466,19 @@ void lse_topk_segment_lse(tvm::ffi::TensorView x,
                           tvm::ffi::TensorView seg_max,
                           tvm::ffi::TensorView seg_sum,
                           int64_t vocab,
-                          int64_t seg_len) {
+                          int64_t seg_len,
+                          int64_t seg_count) {
   using namespace host;
 
   SymbolicSize rows = {"rows"};
   SymbolicSize vocab_s = {"vocab"};
+  SymbolicSize S_s = {"segments"};
   TensorMatcher({rows, vocab_s}).with_dtype<fp32_t>().verify(x);
-  TensorMatcher({rows, kMaxSegments}).with_dtype<fp32_t>().verify(seg_max);
-  TensorMatcher({rows, kMaxSegments}).with_dtype<fp32_t>().verify(seg_sum);
+  TensorMatcher({rows, S_s}).with_dtype<fp32_t>().verify(seg_max);
+  TensorMatcher({rows, S_s}).with_dtype<fp32_t>().verify(seg_sum);
   const int64_t n_rows = rows.unwrap();
   const int64_t n_vocab = vocab_s.unwrap();
+  const int64_t S = S_s.unwrap();
 
   CHECK_HOST(x.device().device_type == kDLCUDA)
       << "lse_topk: x must be a CUDA tensor";
@@ -476,16 +487,18 @@ void lse_topk_segment_lse(tvm::ffi::TensorView x,
       << "lse_topk: vocab must match x and be a multiple of 4, got " << vocab;
   CHECK_HOST(seg_len > 0 && seg_len % 4 == 0)
       << "lse_topk: seg_len must be a positive multiple of 4, got " << seg_len;
+  CHECK_HOST(S == seg_count && S >= 1 && S <= kMaxSegments &&
+             (S & (S - 1)) == 0)
+      << "lse_topk: segments must be a power of two in [1, " << kMaxSegments
+      << "], got " << seg_count;
 
-  LaunchKernel(static_cast<uint32_t>(n_rows) * kMaxSegments,
-               kBlockSize,
-               x.device())
+  LaunchKernel(static_cast<uint32_t>(n_rows * S), kBlockSize, x.device())
       .enable_pdl(kUsePDL)(lse_topk_segment_lse_kernel<kUsePDL>,
                            static_cast<const float*>(x.data_ptr()),
                            static_cast<const float*>(seg_max.data_ptr()),
                            static_cast<float*>(seg_sum.data_ptr()),
                            n_vocab,
-                           kMaxSegments,
+                           static_cast<int>(S),
                            static_cast<int>(seg_len));
 }
 
@@ -506,23 +519,26 @@ void lse_topk_finalize(tvm::ffi::TensorView seg_max,
                        tvm::ffi::TensorView topk_idx,
                        tvm::ffi::TensorView vals,
                        tvm::ffi::TensorView indices,
-                       int64_t k) {
+                       int64_t k,
+                       int64_t seg_count) {
   using namespace host;
 
   SymbolicSize rows = {"rows"};
   SymbolicSize k_s = {"k"};
-  TensorMatcher({rows, kMaxSegments}).with_dtype<fp32_t>().verify(seg_max);
-  TensorMatcher({rows, kMaxSegments}).with_dtype<fp32_t>().verify(seg_sum);
-  TensorMatcher({rows, kMaxSegments, kMaxCandidates})
+  SymbolicSize S_s = {"segments"};
+  TensorMatcher({rows, S_s}).with_dtype<fp32_t>().verify(seg_max);
+  TensorMatcher({rows, S_s}).with_dtype<fp32_t>().verify(seg_sum);
+  TensorMatcher({rows, S_s, kMaxCandidates})
       .with_dtype<fp32_t>()
       .verify(topk_values);
-  TensorMatcher({rows, kMaxSegments, kMaxCandidates})
+  TensorMatcher({rows, S_s, kMaxCandidates})
       .with_dtype<int32_t>()
       .verify(topk_idx);
   TensorMatcher({rows, k_s}).with_dtype<fp32_t>().verify(vals);
   TensorMatcher({rows, k_s}).with_dtype<int64_t>().verify(indices);
   const int64_t n_rows = rows.unwrap();
   const int64_t k_out = k_s.unwrap();
+  const int64_t S = S_s.unwrap();
 
   CHECK_HOST(seg_max.device().device_type == kDLCUDA)
       << "lse_topk: seg_max must be a CUDA tensor";
@@ -531,6 +547,10 @@ void lse_topk_finalize(tvm::ffi::TensorView seg_max,
       << "lse_topk: k must be in [1, " << kMaxCandidates << "], got " << k;
   CHECK_HOST(k_out == k)
       << "lse_topk: output size must equal k, got " << k_out;
+  CHECK_HOST(S == seg_count && S >= 1 && S <= kMaxSegments &&
+             (S & (S - 1)) == 0)
+      << "lse_topk: segments must be a power of two in [1, " << kMaxSegments
+      << "], got " << seg_count;
 
   LaunchKernel(static_cast<uint32_t>(n_rows), kBlockSize, seg_max.device())
       .enable_pdl(kUsePDL)(lse_topk_finalize_kernel<kUsePDL>,
@@ -541,7 +561,7 @@ void lse_topk_finalize(tvm::ffi::TensorView seg_max,
                            static_cast<float*>(vals.data_ptr()),
                            static_cast<int64_t*>(indices.data_ptr()),
                            static_cast<int>(k),
-                           kMaxSegments);
+                           static_cast<int>(S));
 }
 
 }  // namespace sglang

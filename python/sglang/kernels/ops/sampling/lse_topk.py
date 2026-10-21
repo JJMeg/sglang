@@ -107,9 +107,11 @@ def lse_topk(
     )
 
     module = _jit_lse_topk_module()
-    module.lse_topk_segment_scan(x, seg_max, topk_values, topk_idx, k, vocab, seg_len)
-    module.lse_topk_segment_lse(x, seg_max, seg_sum, vocab, seg_len)
+    module.lse_topk_segment_scan(
+        x, seg_max, topk_values, topk_idx, k, vocab, seg_len, _SEGMENTS
+    )
+    module.lse_topk_segment_lse(x, seg_max, seg_sum, vocab, seg_len, _SEGMENTS)
     module.lse_topk_finalize(
-        seg_max, seg_sum, topk_values, topk_idx, out_vals, out_indices, k
+        seg_max, seg_sum, topk_values, topk_idx, out_vals, out_indices, k, _SEGMENTS
     )
     return out_vals, out_indices
