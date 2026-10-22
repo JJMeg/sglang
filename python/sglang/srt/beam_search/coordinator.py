@@ -45,6 +45,10 @@ import msgspec
 import torch
 
 from sglang.kernels.ops.sampling.lse_topk import MAX_K as LSE_TOPK_MAX_K, lse_topk
+from sglang.kernels.ops.sampling.orphan_collect import (
+    MAX_E as ORPHAN_COLLECT_MAX_E,
+    collect_orphan_slots_fused,
+)
 from sglang.srt.beam_search.beam_group import BeamGroup, BeamGroupState
 from sglang.srt.beam_search.fork import (
     MEMBER_LENGTH_MARGIN,
@@ -90,15 +94,10 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-# The fused lse_topk kernels are correct but currently GPU-slower than the
-# torch chain at wide batches (their per-thread lists spill local memory to
-# DRAM). Keep them behind this switch until profiled (ncu) and fixed.
-LSE_TOPK_FUSED = False
-
-# The batched reclaim's tag machinery (cat, tag arithmetic, bincount, counts
-# D2H) only pays off once its fixed overhead is amortized over this many
-# entries; fewer fall back to the per-entry path.
-BATCH_RECLAIM_MIN_ENTRIES = 3
+# Fused batch-invariant lse + torch.topk (the hybrid lse_topk): cuts the
+# per-step CPU dispatch from 6 torch ops to 1 jit call + 2 torch ops, and
+# keeps torch's proven topk kernels for the GPU side.
+LSE_TOPK_FUSED = True
 
 
 def _rows_topk_logprobs(pieces: Sequence[torch.Tensor], num_candidates: int):
@@ -563,15 +562,20 @@ class BeamCoordinator(msgspec.Struct, kw_only=True):
         return staged
 
     def _reclaim_orphans_entry(self, group: BeamGroup, entry: StagedOrphans) -> None:
-        """Reclaim one staged entry: the per-entry path, two syncs (unique +
-        masked select). The caller must be past the tick's copy_done sync."""
+        """Reclaim one staged entry: one fused kernel + one tiny count D2H
+        (the torch reference covers entries above the kernel's size budget).
+        The caller must be past the tick's copy_done sync."""
+        if entry.old_mapping.numel() <= ORPHAN_COLLECT_MAX_E:
+            orphans = collect_orphan_slots_fused(
+                entry.old_mapping, entry.new_mapping
+            )
+        else:
+            orphans = collect_orphan_slots(entry.old_mapping, entry.new_mapping)
         # Plain free(), never a nested free_group: an inner begin/end pair
         # inside the decode path's group double-frees.
-        allocator = self.token_to_kv_pool_allocator
-        orphans = collect_orphan_slots(entry.old_mapping, entry.new_mapping)
         if orphans.numel():
             group.slots_freed += orphans.numel()
-            allocator.free(orphans)
+            self.token_to_kv_pool_allocator.free(orphans)
 
     def _reclaim_orphans(
         self, group: BeamGroup, up_to_tick: Optional[int] = None
@@ -587,50 +591,29 @@ class BeamCoordinator(msgspec.Struct, kw_only=True):
     def _batched_reclaim(self, staged_groups) -> None:
         """One orphan reclaim for every group in this decode commit.
 
-        A single tagged unique computes the union orphan set: each element is
-        tagged with its entry index, so per-entry dedup survives the global
-        unique and a bincount attributes exact per-entry counts. A constant
-        number of syncs for the whole batch instead of one per group.
-        Distinct owners make cross-entry duplicate slots impossible within
-        one drain, so the freed list never double-frees.
-
-        Fewer than BATCH_RECLAIM_MIN_ENTRIES entries fall back to the
-        per-entry path: the tag machinery's fixed overhead only pays off once
-        the amortization covers it."""
+        Each entry runs the fused collect kernel (one tiny count D2H per
+        entry) and the freed slots go out in a single batched allocator
+        free. Distinct owners make cross-entry duplicate slots impossible
+        within one drain, so the freed list never double-frees."""
         entries = [(group, e) for group, staged in staged_groups for e in staged]
         if not entries:
             return
-        if len(entries) < BATCH_RECLAIM_MIN_ENTRIES:
-            for group, entry in entries:
-                with self._timed("reclaim", group):
-                    self._reclaim_orphans_entry(group, entry)
-            return
         start = time.perf_counter()
-        n = len(entries)
-        old_parts = [e.old_mapping.flatten() for _, e in entries]
-        new_parts = [e.new_mapping.flatten() for _, e in entries]
-        sizes = [p.numel() for p in old_parts]
-        device = self.req_to_token_pool.device
-        entry_ids = torch.repeat_interleave(
-            torch.arange(n, dtype=torch.int64, device=device),
-            torch.tensor(sizes, dtype=torch.int64, device=device),
-        )
-        tagged = torch.cat(old_parts) * n + entry_ids
-        tagged_unique = tagged.unique()  # the one sync
-        slots = tagged_unique // n
-        orphan_mask = ~torch.isin(slots, torch.cat(new_parts))
-        orphans = slots[orphan_mask]
-        counts = (
-            torch.bincount(tagged_unique[orphan_mask] % n, minlength=n)
-            .cpu()
-            .tolist()
-        )
-        if orphans.numel():
+        parts = []
+        for group, entry in entries:
+            if entry.old_mapping.numel() <= ORPHAN_COLLECT_MAX_E:
+                orphans = collect_orphan_slots_fused(
+                    entry.old_mapping, entry.new_mapping
+                )
+            else:
+                orphans = collect_orphan_slots(entry.old_mapping, entry.new_mapping)
+            if orphans.numel():
+                group.slots_freed += orphans.numel()
+                parts.append(orphans)
+        if parts:
             # Plain free(), never a nested free_group: an inner begin/end
             # pair inside the decode path's group double-frees.
-            self.token_to_kv_pool_allocator.free(orphans)
-        for (group, _), c in zip(entries, counts):
-            group.slots_freed += c
+            self.token_to_kv_pool_allocator.free(torch.cat(parts))
         ms = (time.perf_counter() - start) * 1000.0
         per_group = ms / len(staged_groups)
         for group, _ in staged_groups:

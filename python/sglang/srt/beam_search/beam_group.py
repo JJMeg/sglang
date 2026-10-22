@@ -40,6 +40,7 @@ class BeamGroupState(enum.Enum):
     FINISHED = enum.auto()
 
 
+
 class CompletedBeam(msgspec.Struct):
     """A finished candidate: leaf node + score inputs + finish reason."""
 
@@ -226,8 +227,6 @@ class BeamGroup:
         self.state = BeamGroupState.FINISHED
         return True
 
-    # Sync wrappers: both halves back-to-back. UT-only -- the scheduler path
-    # drives the two halves separately so they can straddle a forward.
 
     def advance(self, sel: SelectResult) -> bool:
         """Consume one joint_select result; returns True if the group finished."""
